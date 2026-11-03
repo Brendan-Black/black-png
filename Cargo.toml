@@ -1,0 +1,9 @@
+[package]
+name = "black-png"
+version = "0.1.0"
+edition = "2024"
+description = "PNG images, with no third-party dependencies"
+
+# No third-party crates. black-zlib is our own sibling repo; clone it next to this one.
+[dependencies]
+black-zlib = { path = "../black-zlib" }
