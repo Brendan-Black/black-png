@@ -56,6 +56,39 @@ pub fn best(row: &[u8], prev: &[u8], bpp: usize, out: &mut Vec<u8>, scratch: &mu
     out.extend_from_slice(scratch);
 }
 
+
+/// Undo filter `kind` on `row` in place, given the already-decoded row above. False if
+/// `kind` isn't a filter type.
+pub fn undo(kind: u8, row: &mut [u8], prev: &[u8], bpp: usize) -> bool {
+    match kind {
+        NONE => {}
+        SUB => {
+            for i in bpp..row.len() {
+                row[i] = row[i].wrapping_add(row[i - bpp]);
+            }
+        }
+        UP => {
+            for (x, &b) in row.iter_mut().zip(prev) {
+                *x = x.wrapping_add(b);
+            }
+        }
+        AVERAGE => {
+            for i in 0..row.len() {
+                let a = if i >= bpp { row[i - bpp] } else { 0 };
+                row[i] = row[i].wrapping_add(((a as u16 + prev[i] as u16) / 2) as u8);
+            }
+        }
+        PAETH => {
+            for i in 0..row.len() {
+                let (a, c) = if i >= bpp { (row[i - bpp], prev[i - bpp]) } else { (0, 0) };
+                row[i] = row[i].wrapping_add(paeth(a, prev[i], c));
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +115,19 @@ mod tests {
         assert_eq!(out, [10, 15, 33 - 22, 50 - 32]);
         apply(NONE, &row, &prev, 2, &mut out);
         assert_eq!(out, row);
+    }
+
+    #[test]
+    fn undo_reverses_apply() {
+        let prev = [200, 3, 90, 255, 0, 17, 64];
+        let row = [1, 250, 33, 128, 7, 7, 200];
+        for kind in [NONE, SUB, UP, AVERAGE, PAETH] {
+            let mut out = [0u8; 7];
+            apply(kind, &row, &prev, 3, &mut out);
+            assert!(undo(kind, &mut out, &prev, 3));
+            assert_eq!(out, row, "filter {kind}");
+        }
+        assert!(!undo(5, &mut [0], &[0], 1));
     }
 
     #[test]

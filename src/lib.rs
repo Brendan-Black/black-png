@@ -1,7 +1,8 @@
 //! PNG images, with no third-party dependencies. Compression comes from black-zlib, a
 //! sibling crate of ours.
 //!
-//! [`encode`] writes 8-bit grayscale, gray + alpha, RGB or RGBA pixels as a PNG.
+//! - [`encode`] writes 8-bit grayscale, gray + alpha, RGB or RGBA pixels as a PNG.
+//! - [`decode`] reads a PNG into an [`Image`] (8-bit, not interlaced, so far).
 //!
 //! ```
 //! use black_png::{ColorType, Compression};
@@ -9,14 +10,17 @@
 //! // A 2x1 image: one red pixel, one blue.
 //! let png = black_png::encode(2, 1, ColorType::Rgb, &[255, 0, 0, 0, 0, 255], Compression::Default)?;
 //! assert!(png.starts_with(b"\x89PNG"));
+//! assert_eq!(black_png::decode(&png, 1 << 20)?.pixels, [255, 0, 0, 0, 0, 255]);
 //! # Ok::<(), black_png::Error>(())
 //! ```
 
+mod decode;
 mod encode;
 mod error;
 mod filter;
 
 pub use black_zlib::Compression;
+pub use decode::{Image, decode};
 pub use encode::encode;
 pub use error::{Error, Result};
 

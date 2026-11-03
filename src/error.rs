@@ -6,6 +6,8 @@ pub enum Error {
     Invalid(String),
     /// The PNG is damaged, cut short or not a PNG.
     Corrupt(String),
+    /// A valid PNG that uses something this crate doesn't read yet.
+    Unsupported(String),
     /// Decoding would produce more than the caller allowed.
     TooLarge { limit: usize },
 }
@@ -36,6 +38,7 @@ impl fmt::Display for Error {
         match self {
             Error::Invalid(msg) => f.write_str(msg),
             Error::Corrupt(msg) => write!(f, "corrupt PNG: {msg}"),
+            Error::Unsupported(what) => write!(f, "this PNG uses {what}, which black-png can't read yet"),
             Error::TooLarge { limit } => write!(f, "the image is bigger than the {limit}-byte limit"),
         }
     }
