@@ -36,15 +36,69 @@ impl std::fmt::Debug for Image {
     }
 }
 
+/// How the file stores each pixel, which can differ from the [`ColorType`] it decodes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stored {
+    Gray,
+    Rgb,
+    Palette,
+    GrayAlpha,
+    Rgba,
+}
+
+impl Stored {
+    fn samples(self) -> usize {
+        match self {
+            Stored::Gray | Stored::Palette => 1,
+            Stored::GrayAlpha => 2,
+            Stored::Rgb => 3,
+            Stored::Rgba => 4,
+        }
+    }
+}
+
 /// The header: what IHDR says about the image.
 struct Header {
     width: u32,
     height: u32,
-    color: ColorType,
+    depth: u8,
+    stored: Stored,
+    interlaced: bool,
 }
 
-/// Decode a PNG, refusing images whose pixels would take more than `max_bytes`. Checks
-/// every chunk's CRC. Ancillary chunks (text, gamma, timestamps and the like) are skipped.
+impl Header {
+    fn bits_per_pixel(&self) -> usize {
+        self.stored.samples() * self.depth as usize
+    }
+
+    /// Bytes in a row `width` pixels wide, before its filter byte.
+    fn row_bytes(&self, width: usize) -> usize {
+        (width * self.bits_per_pixel()).div_ceil(8)
+    }
+}
+
+/// What tRNS says is transparent: one exact color (as stored, before scaling to 8 bits),
+/// or an alpha for each palette entry.
+enum Transparency {
+    None,
+    Gray(u16),
+    Rgb([u16; 3]),
+    Palette(Vec<u8>),
+}
+
+/// The passes an image's pixels come in: (first x, first y, x step, y step). Interlaced
+/// (Adam7) images send every 8th pixel of every 8th row first, then fill in.
+const ONE_PASS: [(usize, usize, usize, usize); 1] = [(0, 0, 1, 1)];
+const ADAM7: [(usize, usize, usize, usize); 7] =
+    [(0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2)];
+
+/// Decode a PNG, refusing images whose pixels would take more than `max_bytes`.
+///
+/// Reads every standard PNG: grayscale (1, 2, 4, 8 or 16 bits), RGB, palette, gray + alpha
+/// and RGBA, interlaced or not. Pixels always come out as 8 bits per channel: 16-bit
+/// channels are rounded, low-bit gray is scaled up (a 1-bit image gives 0 and 255),
+/// palette images become RGB, and a tRNS chunk adds an alpha channel. Checks every chunk's
+/// CRC; ancillary chunks (text, gamma, color profiles and the like) are skipped.
 pub fn decode(png: &[u8], max_bytes: usize) -> Result<Image> {
     let Some(rest) = png.strip_prefix(&SIGNATURE) else {
         return Err(Error::corrupt("not a PNG (wrong signature)"));
@@ -55,40 +109,96 @@ pub fn decode(png: &[u8], max_bytes: usize) -> Result<Image> {
         return Err(Error::corrupt("the first chunk isn't IHDR"));
     }
     let h = header(data)?;
-
-    let bpp = h.color.channels();
-    let stride = h.width as usize * bpp;
-    let size = stride.checked_mul(h.height as usize).filter(|&n| n <= max_bytes);
-    let Some(size) = size else {
+    // Refuse a too-big image straight away, at the smallest it could decode to (tRNS can
+    // add an alpha channel, checked again below).
+    let least_channels = if h.stored == Stored::Palette { 3 } else { h.stored.samples() };
+    if (h.width as u64 * h.height as u64).saturating_mul(least_channels as u64) > max_bytes as u64 {
         return Err(Error::TooLarge { limit: max_bytes });
-    };
+    }
 
+    let mut palette: Option<&[u8]> = None;
+    let mut trns = Transparency::None;
     // The compressed pixels are split over consecutive IDAT chunks.
     let mut idat = Vec::new();
     let mut idat_done = false;
     for chunk in chunks {
         let (kind, data) = chunk?;
+        if !idat.is_empty() && &kind != b"IDAT" {
+            idat_done = true;
+        }
+        let before_idat = |name: &str| {
+            if idat.is_empty() { Ok(()) } else { Err(Error::corrupt(format!("{name} comes after the pixel data"))) }
+        };
         match &kind {
             b"IDAT" if idat_done => return Err(Error::corrupt("IDAT chunks aren't consecutive")),
             b"IDAT" => idat.extend_from_slice(data),
             b"IEND" => break,
             b"IHDR" => return Err(Error::corrupt("a second IHDR")),
-            // PLTE is only a suggested palette for truecolor images; nothing needs it yet.
-            b"PLTE" => {}
+            b"PLTE" => {
+                before_idat("PLTE")?;
+                if matches!(h.stored, Stored::Gray | Stored::GrayAlpha) {
+                    return Err(Error::corrupt("a palette in a grayscale image"));
+                }
+                if data.is_empty() || data.len() % 3 != 0 || data.len() > 256 * 3 {
+                    return Err(Error::corrupt(format!("a {}-byte palette", data.len())));
+                }
+                palette = Some(data);
+            }
+            b"tRNS" => {
+                before_idat("tRNS")?;
+                let u16_at = |i: usize| u16::from_be_bytes([data[i], data[i + 1]]);
+                trns = match h.stored {
+                    Stored::Gray if data.len() == 2 => Transparency::Gray(u16_at(0)),
+                    Stored::Rgb if data.len() == 6 => Transparency::Rgb([u16_at(0), u16_at(2), u16_at(4)]),
+                    Stored::Palette if palette.is_some_and(|p| data.len() <= p.len() / 3) => Transparency::Palette(data.to_vec()),
+                    Stored::Palette if palette.is_none() => return Err(Error::corrupt("tRNS before PLTE")),
+                    // Images with an alpha channel can't have tRNS; ignore it, as libpng does.
+                    Stored::GrayAlpha | Stored::Rgba => Transparency::None,
+                    _ => return Err(Error::corrupt(format!("a {}-byte tRNS for a {:?} image", data.len(), h.stored))),
+                };
+            }
             _ if kind[0].is_ascii_uppercase() => {
                 return Err(Error::Unsupported(format!("the critical chunk {}", String::from_utf8_lossy(&kind))));
             }
             _ => {}
         }
-        if !idat.is_empty() && &kind != b"IDAT" {
-            idat_done = true;
-        }
     }
     if idat.is_empty() {
         return Err(Error::corrupt("no IDAT chunk"));
     }
+    let palette = match (h.stored, palette) {
+        (Stored::Palette, None) => return Err(Error::corrupt("a palette image with no PLTE")),
+        (_, p) => p.unwrap_or(&[]),
+    };
 
-    let filtered_len = (stride + 1) * h.height as usize;
+    let has_trns = !matches!(trns, Transparency::None);
+    let color = match h.stored {
+        Stored::Gray if has_trns => ColorType::GrayAlpha,
+        Stored::Gray => ColorType::Gray,
+        Stored::GrayAlpha => ColorType::GrayAlpha,
+        Stored::Rgb | Stored::Palette if has_trns => ColorType::Rgba,
+        Stored::Rgb | Stored::Palette => ColorType::Rgb,
+        Stored::Rgba => ColorType::Rgba,
+    };
+    let (w, ht) = (h.width as usize, h.height as usize);
+    let channels = color.channels();
+    let size = w.checked_mul(ht).and_then(|n| n.checked_mul(channels)).filter(|&n| n <= max_bytes);
+    let Some(size) = size else {
+        return Err(Error::TooLarge { limit: max_bytes });
+    };
+
+    // Each pass is a smaller image of its own; a pass with no pixels has no rows at all.
+    let passes: &[(usize, usize, usize, usize)] = if h.interlaced { &ADAM7 } else { &ONE_PASS };
+    let pass_size = |&(x0, y0, dx, dy): &(usize, usize, usize, usize)| {
+        (if w > x0 { (w - x0).div_ceil(dx) } else { 0 }, if ht > y0 { (ht - y0).div_ceil(dy) } else { 0 })
+    };
+    let filtered_len: usize = passes
+        .iter()
+        .map(|p| match pass_size(p) {
+            (0, _) | (_, 0) => 0,
+            (pw, ph) => ph * (1 + h.row_bytes(pw)),
+        })
+        .sum();
     let filtered = black_zlib::zlib::decompress(&idat, filtered_len).map_err(|e| match e {
         black_zlib::Error::TooLarge { .. } => Error::corrupt("more pixel data than the image holds"),
         e => e.into(),
@@ -98,18 +208,105 @@ pub fn decode(png: &[u8], max_bytes: usize) -> Result<Image> {
     }
 
     let mut pixels = vec![0u8; size];
-    let zeros = vec![0u8; stride];
-    for y in 0..h.height as usize {
-        let src = &filtered[y * (stride + 1)..(y + 1) * (stride + 1)];
-        let (done, row) = pixels.split_at_mut(y * stride);
-        let prev = if y == 0 { &zeros[..] } else { &done[(y - 1) * stride..] };
-        let row = &mut row[..stride];
-        row.copy_from_slice(&src[1..]);
-        if !filter::undo(src[0], row, prev, bpp) {
-            return Err(Error::corrupt(format!("unknown filter type {} on row {y}", src[0])));
+    let direct = h.depth == 8 && !h.interlaced && !has_trns && h.stored != Stored::Palette;
+    let filter_bpp = h.bits_per_pixel().div_ceil(8);
+    let mut pos = 0;
+    for pass in passes {
+        let (pw, ph) = pass_size(pass);
+        if pw == 0 || ph == 0 {
+            continue;
+        }
+        let (x0, y0, dx, dy) = *pass;
+        let rb = h.row_bytes(pw);
+        let mut prev = vec![0u8; rb];
+        let mut row = vec![0u8; rb];
+        for j in 0..ph {
+            let kind = filtered[pos];
+            row.copy_from_slice(&filtered[pos + 1..pos + 1 + rb]);
+            pos += 1 + rb;
+            if !filter::undo(kind, &mut row, &prev, filter_bpp) {
+                return Err(Error::corrupt(format!("unknown filter type {kind}")));
+            }
+            let y = y0 + j * dy;
+            if direct {
+                // Stored exactly as decoded: the row is the pixels.
+                pixels[y * w * channels..(y + 1) * w * channels].copy_from_slice(&row);
+            } else {
+                for i in 0..pw {
+                    let x = x0 + i * dx;
+                    let at = (y * w + x) * channels;
+                    pixel(&h, &row, i, palette, &trns, &mut pixels[at..at + channels])?;
+                }
+            }
+            std::mem::swap(&mut prev, &mut row);
         }
     }
-    Ok(Image { width: h.width, height: h.height, color: h.color, pixels })
+    Ok(Image { width: h.width, height: h.height, color, pixels })
+}
+
+/// Sample `k` of a row (counting every channel of every pixel), as stored.
+fn sample(row: &[u8], depth: u8, k: usize) -> u16 {
+    match depth {
+        8 => row[k] as u16,
+        16 => u16::from_be_bytes([row[2 * k], row[2 * k + 1]]),
+        d => {
+            // Packed with the leftmost pixel in the highest bits.
+            let bit = k * d as usize;
+            ((row[bit / 8] >> (8 - d as usize - bit % 8)) & ((1 << d) - 1)) as u16
+        }
+    }
+}
+
+/// A sample scaled to 8 bits.
+fn scale(v: u16, depth: u8) -> u8 {
+    match depth {
+        1 => (v * 255) as u8,
+        2 => (v * 85) as u8,
+        4 => (v * 17) as u8,
+        8 => v as u8,
+        _ => ((v as u32 * 255 + 32767) / 65535) as u8,
+    }
+}
+
+/// Write pixel `i` of a row into `out`, in the decoded color type.
+fn pixel(h: &Header, row: &[u8], i: usize, palette: &[u8], trns: &Transparency, out: &mut [u8]) -> Result<()> {
+    let d = h.depth;
+    let n = h.stored.samples();
+    let s = |c: usize| sample(row, d, i * n + c);
+    match h.stored {
+        Stored::Palette => {
+            let idx = s(0) as usize;
+            let Some(rgb) = palette.get(idx * 3..idx * 3 + 3) else {
+                return Err(Error::corrupt(format!("palette index {idx} past the {}-color palette", palette.len() / 3)));
+            };
+            out[..3].copy_from_slice(rgb);
+            if let Transparency::Palette(alpha) = trns {
+                out[3] = alpha.get(idx).copied().unwrap_or(255);
+            }
+        }
+        Stored::Gray => {
+            let v = s(0);
+            out[0] = scale(v, d);
+            if let Transparency::Gray(t) = trns {
+                out[1] = if v == *t { 0 } else { 255 };
+            }
+        }
+        Stored::Rgb => {
+            let rgb = [s(0), s(1), s(2)];
+            for c in 0..3 {
+                out[c] = scale(rgb[c], d);
+            }
+            if let Transparency::Rgb(t) = trns {
+                out[3] = if rgb == *t { 0 } else { 255 };
+            }
+        }
+        Stored::GrayAlpha | Stored::Rgba => {
+            for (c, o) in out.iter_mut().enumerate() {
+                *o = scale(s(c), d);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn header(d: &[u8]) -> Result<Header> {
@@ -125,21 +322,18 @@ fn header(d: &[u8]) -> Result<Header> {
     if compression != 0 || filter != 0 || interlace > 1 {
         return Err(Error::corrupt("unknown compression, filter or interlace method"));
     }
-    let color = match color {
-        0 => ColorType::Gray,
-        2 => ColorType::Rgb,
-        4 => ColorType::GrayAlpha,
-        6 => ColorType::Rgba,
-        3 => return Err(Error::Unsupported("palette images".into())),
+    let (stored, depths): (Stored, &[u8]) = match color {
+        0 => (Stored::Gray, &[1, 2, 4, 8, 16]),
+        2 => (Stored::Rgb, &[8, 16]),
+        3 => (Stored::Palette, &[1, 2, 4, 8]),
+        4 => (Stored::GrayAlpha, &[8, 16]),
+        6 => (Stored::Rgba, &[8, 16]),
         c => return Err(Error::corrupt(format!("unknown color type {c}"))),
     };
-    if depth != 8 {
-        return Err(Error::Unsupported(format!("{depth}-bit channels")));
+    if !depths.contains(&depth) {
+        return Err(Error::corrupt(format!("{depth}-bit {stored:?} isn't a PNG format")));
     }
-    if interlace == 1 {
-        return Err(Error::Unsupported("interlaced images".into()));
-    }
-    Ok(Header { width, height, color })
+    Ok(Header { width, height, depth, stored, interlaced: interlace == 1 })
 }
 
 /// Walks the chunks after the signature, checking each CRC.
@@ -200,11 +394,15 @@ mod tests {
         out
     }
 
-    /// A PNG built by hand from an IHDR and the filtered rows.
     fn hand_made(width: u32, height: u32, color: u8, rows: &[u8], extra: &[Vec<u8>]) -> Vec<u8> {
+        hand_made_with(width, height, 8, color, false, rows, extra)
+    }
+
+    /// A PNG built by hand from an IHDR and the filtered rows, with `extra` chunks between.
+    fn hand_made_with(width: u32, height: u32, depth: u8, color: u8, interlaced: bool, rows: &[u8], extra: &[Vec<u8>]) -> Vec<u8> {
         let mut ihdr = width.to_be_bytes().to_vec();
         ihdr.extend(height.to_be_bytes());
-        ihdr.extend([8, color, 0, 0, 0]);
+        ihdr.extend([depth, color, 0, 0, interlaced as u8]);
         let mut png = SIGNATURE.to_vec();
         png.extend(chunk(b"IHDR", &ihdr));
         for e in extra {
@@ -253,6 +451,101 @@ mod tests {
         assert_eq!(decode(&png, 100).unwrap().pixels, [7, 9]);
     }
 
+
+    #[test]
+    fn samples_and_scaling() {
+        let row = [0b1011_0010];
+        assert_eq!((0..8).map(|k| sample(&row, 1, k)).collect::<Vec<_>>(), [1, 0, 1, 1, 0, 0, 1, 0]);
+        assert_eq!((0..4).map(|k| sample(&row, 2, k)).collect::<Vec<_>>(), [2, 3, 0, 2]);
+        assert_eq!((0..2).map(|k| sample(&row, 4, k)).collect::<Vec<_>>(), [0xB, 0x2]);
+        assert_eq!(sample(&[0x12, 0x34, 0x56, 0x78], 16, 1), 0x5678);
+        assert_eq!([scale(1, 1), scale(3, 2), scale(15, 4), scale(65535, 16)], [255; 4]);
+        assert_eq!([scale(1, 2), scale(7, 4), scale(0, 16)], [85, 119, 0]);
+        // 16 bits round to the nearest 8-bit value: 128.5 / 65535 * 255 is the halfway point.
+        assert_eq!([scale(128, 16), scale(129, 16), scale(32767, 16), scale(32768, 16)], [0, 1, 127, 128]);
+    }
+
+    #[test]
+    fn single_color_transparency() {
+        // 8-bit gray where 5 is transparent.
+        let img = decode(&hand_made(3, 1, 0, &[0, 5, 9, 5], &[chunk(b"tRNS", &[0, 5])]), 100).unwrap();
+        assert_eq!((img.color, img.pixels), (ColorType::GrayAlpha, vec![5, 0, 9, 255, 5, 0]));
+        // 16-bit gray compares the full value: 0x0102 is transparent and 0x0103 isn't,
+        // though both round to 1.
+        let png = hand_made_with(2, 1, 16, 0, false, &[0, 1, 2, 1, 3], &[chunk(b"tRNS", &[1, 2])]);
+        assert_eq!(decode(&png, 100).unwrap().pixels, [1, 0, 1, 255]);
+        // RGB where (1, 2, 3) is transparent.
+        let png = hand_made(2, 1, 2, &[0, 1, 2, 3, 1, 2, 4], &[chunk(b"tRNS", &[0, 1, 0, 2, 0, 3])]);
+        let img = decode(&png, 100).unwrap();
+        assert_eq!((img.color, img.pixels), (ColorType::Rgba, vec![1, 2, 3, 0, 1, 2, 4, 255]));
+        // An image with alpha ignores tRNS, as libpng does.
+        let png = hand_made(1, 1, 6, &[0, 1, 2, 3, 4], &[chunk(b"tRNS", &[0, 1, 0, 2, 0, 3])]);
+        assert_eq!(decode(&png, 100).unwrap().pixels, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn palettes() {
+        // 2-bit indices 0, 1, 2 into three colors, the first two partly transparent.
+        let plte = chunk(b"PLTE", &[10, 20, 30, 40, 50, 60, 70, 80, 90]);
+        let png = hand_made_with(3, 1, 2, 3, false, &[0, 0b00_01_10_00], &[plte.clone(), chunk(b"tRNS", &[0, 128])]);
+        let img = decode(&png, 100).unwrap();
+        assert_eq!(img.color, ColorType::Rgba);
+        assert_eq!(img.pixels, [10, 20, 30, 0, 40, 50, 60, 128, 70, 80, 90, 255]);
+        // Without tRNS it's plain RGB.
+        let img = decode(&hand_made(2, 1, 3, &[0, 2, 0], &[plte]), 100).unwrap();
+        assert_eq!((img.color, img.pixels), (ColorType::Rgb, vec![70, 80, 90, 10, 20, 30]));
+    }
+
+    #[test]
+    fn sixteen_bit_gray_alpha() {
+        let img = decode(&hand_made_with(1, 1, 16, 4, false, &[0, 0xFF, 0xFF, 0x80, 0x00], &[]), 100).unwrap();
+        assert_eq!((img.color, img.pixels), (ColorType::GrayAlpha, vec![255, 128]));
+    }
+
+    /// Interlace 8-bit gray pixels the Adam7 way, filter type 0 on every row.
+    fn adam7(px: &[u8], w: usize, h: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (x0, y0, dx, dy) in ADAM7 {
+            let xs: Vec<usize> = (x0..w).step_by(dx).collect();
+            if xs.is_empty() {
+                continue;
+            }
+            for y in (y0..h).step_by(dy) {
+                out.push(0);
+                out.extend(xs.iter().map(|&x| px[y * w + x]));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn interlaced() {
+        for (w, h) in [(1, 1), (2, 3), (8, 8), (9, 9), (17, 5), (3, 20)] {
+            let px: Vec<u8> = (0..w * h).map(|i| (i * 7 + 1) as u8).collect();
+            let png = hand_made_with(w as u32, h as u32, 8, 0, true, &adam7(&px, w, h), &[]);
+            assert_eq!(decode(&png, 1000).unwrap().pixels, px, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn rejects_bad_colors() {
+        let corrupt = |png: &[u8]| matches!(decode(png, 1000), Err(Error::Corrupt(_)));
+        let plte = || chunk(b"PLTE", &[1, 2, 3]);
+        assert!(corrupt(&hand_made(1, 1, 0, &[0, 1], &[chunk(b"tRNS", &[0, 1, 2])])), "gray tRNS length");
+        assert!(corrupt(&hand_made(1, 1, 2, &[0, 1, 2, 3], &[chunk(b"tRNS", &[0, 1])])), "RGB tRNS length");
+        assert!(corrupt(&hand_made(1, 1, 3, &[0, 0], &[chunk(b"tRNS", &[0])])), "tRNS before PLTE");
+        assert!(corrupt(&hand_made(1, 1, 3, &[0, 0], &[plte(), chunk(b"tRNS", &[0, 0])])), "tRNS longer than the palette");
+        assert!(corrupt(&hand_made(1, 1, 0, &[0, 1], &[plte()])), "PLTE in gray");
+        assert!(corrupt(&hand_made(1, 1, 3, &[0, 1], &[chunk(b"PLTE", &[1, 2, 3, 4])])), "palette length");
+        assert!(corrupt(&hand_made(1, 1, 3, &[0, 1], &[plte()])), "index past the palette");
+        assert!(corrupt(&hand_made_with(1, 1, 4, 2, false, &[0, 0], &[])), "4-bit RGB");
+        assert!(corrupt(&hand_made_with(1, 1, 16, 3, false, &[0, 0, 0], &[plte()])), "16-bit palette");
+        // PLTE after the pixel data.
+        let mut late = hand_made(1, 1, 3, &[0, 0], &[plte()]);
+        let iend = late.len() - 12;
+        late.splice(iend..iend, plte());
+        assert!(corrupt(&late));
+    }
     #[test]
     fn rejects_bad_pngs() {
         let good = encode(3, 2, ColorType::Rgb, &picture(18), Compression::Fast).unwrap();
@@ -282,7 +575,7 @@ mod tests {
         assert!(corrupt(&ihdr_second), "IHDR not first");
 
         assert!(unsupported(&hand_made(1, 1, 0, &[0, 1], &[chunk(b"ZZZZ", &[])])), "unknown critical chunk");
-        assert!(unsupported(&hand_made(1, 1, 3, &[0, 0], &[])), "palette, for now");
+        assert!(corrupt(&hand_made(1, 1, 3, &[0, 0], &[])), "palette with no PLTE");
     }
 
     #[test]

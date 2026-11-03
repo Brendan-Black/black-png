@@ -2,7 +2,7 @@
 //! sibling crate of ours.
 //!
 //! - [`encode`] writes 8-bit grayscale, gray + alpha, RGB or RGBA pixels as a PNG.
-//! - [`decode`] reads a PNG into an [`Image`] (8-bit, not interlaced, so far).
+//! - [`decode`] reads any standard PNG into an [`Image`] of 8-bit channels.
 //!
 //! ```
 //! use black_png::{ColorType, Compression};
