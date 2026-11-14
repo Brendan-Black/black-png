@@ -2,11 +2,13 @@
 name = "black-png"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/Brendan-Black/black-png"
 description = "PNG images, with no third-party dependencies"
 
-# No third-party crates. black-zlib is our own sibling repo; clone it next to this one.
+# No third-party crates. black-zlib is our own, pinned to a release tag.
 [dependencies]
-black-zlib = { path = "../black-zlib" }
+black-zlib = { git = "https://github.com/Brendan-Black/black-zlib", tag = "v0.1.0" }
 
 [package.metadata.black]
 version = "0.1.0"

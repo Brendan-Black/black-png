@@ -1,8 +1,8 @@
 # black-png
 
 PNG images with **no third-party dependencies**. Compression comes from
-[black-zlib](https://github.com/Brendan-Black/black-zlib), a sibling repo of ours; clone it
-next to this one. Works on any platform.
+[black-zlib](https://github.com/Brendan-Black/black-zlib), our own crate, pulled in as a
+git dependency. Works on any platform.
 
 - `encode`: write 8-bit grayscale, gray + alpha, RGB or RGBA pixels as a PNG, choosing
   each row's filter the way libpng does, at black-zlib's `Fast`, `Default` or `Best` level.
@@ -30,4 +30,9 @@ assert_eq!(back.pixels, [255, 0, 0, 0, 0, 255]);
 Windows' own PNG code through PowerShell: GDI+ must read every pixel we write, and we must
 read every pixel GDI+ writes and every format WIC writes (1, 2, 4, 8 and 16-bit gray,
 1, 2, 4 and 8-bit palettes with transparency, 8 and 16-bit RGB and RGBA, each interlaced
-and not, at several sizes). From WSL, `winrun --test` builds the tests and runs them there.
+and not, at several sizes). From WSL, cross-build the tests with
+[cargo-xwin](https://github.com/rust-cross/cargo-xwin) and run them on Windows.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
