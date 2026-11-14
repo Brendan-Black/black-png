@@ -311,9 +311,9 @@ fn header(d: &[u8]) -> Result<Header> {
 	let Ok(d) = <&[u8; 13]>::try_from(d) else {
 		return Err(Error::corrupt("IHDR isn't 13 bytes"));
 	};
-	let width = u32::from_be_bytes(d[0..4].try_into().unwrap());
-	let height = u32::from_be_bytes(d[4..8].try_into().unwrap());
-	let [depth, color, compression, filter, interlace] = d[8..13].try_into().unwrap();
+	let [w0, w1, w2, w3, h0, h1, h2, h3, depth, color, compression, filter, interlace] = *d;
+	let width = u32::from_be_bytes([w0, w1, w2, w3]);
+	let height = u32::from_be_bytes([h0, h1, h2, h3]);
 	if width == 0 || height == 0 || width > i32::MAX as u32 || height > i32::MAX as u32 {
 		return Err(Error::corrupt(format!("a PNG can't be {width}x{height}")));
 	}
@@ -351,15 +351,16 @@ impl<'a> Iterator for Chunks<'a> {
 		let Some(head) = r.first_chunk::<8>() else {
 			return cut();
 		};
-		let len = u32::from_be_bytes(head[..4].try_into().unwrap()) as usize;
-		let kind: [u8; 4] = head[4..].try_into().unwrap();
+		let [l0, l1, l2, l3, k0, k1, k2, k3] = *head;
+		let len = u32::from_be_bytes([l0, l1, l2, l3]) as usize;
+		let kind = [k0, k1, k2, k3];
 		if len > i32::MAX as usize {
 			return Some(Err(Error::corrupt("a chunk claims to be over 2 GiB")));
 		}
-		let Some(crc) = r.get(8 + len..12 + len) else {
+		let Some(crc) = r.get(8 + len..12 + len).and_then(|c| <[u8; 4]>::try_from(c).ok()) else {
 			return cut();
 		};
-		if u32::from_be_bytes(crc.try_into().unwrap()) != crc32(&r[4..8 + len]) {
+		if u32::from_be_bytes(crc) != crc32(&r[4..8 + len]) {
 			return Some(Err(Error::corrupt(format!("the {} chunk's CRC doesn't match", String::from_utf8_lossy(&kind)))));
 		}
 		self.rest = &r[12 + len..];
