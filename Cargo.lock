@@ -12,3 +12,4 @@ dependencies = [
 [[package]]
 name = "black-zlib"
 version = "0.1.0"
+source = "git+https://github.com/Brendan-Black/black-zlib?tag=v0.1.0#566e0585a394b4b9720f4159af68ed137bfc77a9"
