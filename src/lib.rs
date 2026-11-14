@@ -30,34 +30,34 @@ pub const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n
 /// How each pixel is laid out: 8 bits per channel, channels in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ColorType {
-    /// One byte per pixel.
-    Gray,
-    /// Gray, then alpha.
-    GrayAlpha,
-    /// Red, green, blue.
-    Rgb,
-    /// Red, green, blue, alpha.
-    Rgba,
+	/// One byte per pixel.
+	Gray,
+	/// Gray, then alpha.
+	GrayAlpha,
+	/// Red, green, blue.
+	Rgb,
+	/// Red, green, blue, alpha.
+	Rgba,
 }
 
 impl ColorType {
-    /// Bytes per pixel.
-    pub fn channels(self) -> usize {
-        match self {
-            ColorType::Gray => 1,
-            ColorType::GrayAlpha => 2,
-            ColorType::Rgb => 3,
-            ColorType::Rgba => 4,
-        }
-    }
+	/// Bytes per pixel.
+	pub fn channels(self) -> usize {
+		match self {
+			ColorType::Gray => 1,
+			ColorType::GrayAlpha => 2,
+			ColorType::Rgb => 3,
+			ColorType::Rgba => 4,
+		}
+	}
 
-    /// The color type number in a PNG header.
-    fn code(self) -> u8 {
-        match self {
-            ColorType::Gray => 0,
-            ColorType::Rgb => 2,
-            ColorType::GrayAlpha => 4,
-            ColorType::Rgba => 6,
-        }
-    }
+	/// The color type number in a PNG header.
+	fn code(self) -> u8 {
+		match self {
+			ColorType::Gray => 0,
+			ColorType::Rgb => 2,
+			ColorType::GrayAlpha => 4,
+			ColorType::Rgba => 6,
+		}
+	}
 }
