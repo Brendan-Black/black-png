@@ -11,7 +11,7 @@ description = "PNG images, with no third-party dependencies"
 black-zlib = { git = "https://github.com/Brendan-Black/black-zlib", tag = "v0.1.0" }
 
 [package.metadata.black]
-version = "0.2.3"
+version = "0.2.4"
 
 # black-rust: compiler and Clippy lints. Owned by cargo black; edit it in black-rust, not here.
 # Everything else is rustc's and Clippy's defaults, which `cargo black check` runs with -D warnings.
